@@ -27,17 +27,17 @@
 #define NVS_NAMESPACE "wifi"
 
 // Define Firebase project API Key
-#define API_KEY "AIzaSyB_wTtnR7BVhfx25VwfIv8mcIUcGg07e8c"
+#define API_KEY ""
 
 // Define Firebase Realtime Database URL
-#define DATABASE_URL "https://nextgen-pemss-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define DATABASE_URL ""
 
 // Define Firebase Firestore Project ID (extract from your database URL)
-#define FIREBASE_PROJECT_ID "nextgen-pemss"
+#define FIREBASE_PROJECT_ID ""
 
 // Define Firebase authentication email and password
-#define FIREBASE_EMAIL "pemssclient2@gmail.com"
-#define FIREBASE_PASSWORD "pemssclientacc"
+#define FIREBASE_EMAIL "example@gmail.com"
+#define FIREBASE_PASSWORD "password"
 
 // Define PN532 pins
 #define PN532_SCK   18
@@ -419,7 +419,7 @@ void detectAndWriteNFC() {
     lcd.print("Not an Admin");
     delay(3000);
     lcd.clear();
-    lcd.print("PEMSS");
+    lcd.print("");
     // Serial.println("Write mode is disabled: Not an Admin");
     // (Original write logic commented out below)
     /*
