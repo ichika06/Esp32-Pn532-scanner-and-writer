@@ -17,8 +17,8 @@
 
 // Define GPIO pins for the switches and buttons
 #define SWITCH_PIN_UP 14
-#define SWITCH_PIN_DOWN 12
-#define SWITCH_PIN_SELECT 27
+#define SWITCH_PIN_DOWN 27
+#define SWITCH_PIN_SELECT 12
 #define LED_GREEN 33
 #define LED_YELLOW 32
 #define LED_RED 4
@@ -37,7 +37,7 @@
 
 // Define Firebase authentication email and password
 #define FIREBASE_EMAIL "esp32admin1@gmail.com"
-#define FIREBASE_PASSWORD "123456"
+#define FIREBASE_PASSWORD "pemssadmin123456"
 
 // Define PN532 pins
 #define PN532_SCK   18
@@ -71,6 +71,9 @@ bool wifiMode = false; // Flag to track Wi-Fi mode
 bool serialUsbMode = false; // Flag to track Serial-USB mode
 bool firebaseInitialized = false; // Flag to track Firebase initialization
 bool wifiConnected = false; // Flag to track WiFi connection status
+
+// Heartbeat state variable (now global, not static in loop)
+bool heartbeatInitialized = false;
 
 void pNote(int frequency, int duration) {
     tone(BUZZER, frequency, duration);
@@ -120,6 +123,9 @@ void playStartupTone() {
   }
 }
 
+// --- Forward declaration for device status update ---
+void setDeviceStatus(const String& status);
+
 void setup() {
     Serial.begin(115200);
     Serial.println("ESP32 NFC Reader/Writer Ready");
@@ -131,6 +137,7 @@ void setup() {
     pinMode(SWITCH_PIN_UP, INPUT_PULLUP);
     pinMode(SWITCH_PIN_DOWN, INPUT_PULLUP);
     pinMode(SWITCH_PIN_SELECT, INPUT_PULLUP);
+    
 
     Wire.begin(SDA_LCD, SCL_LCD);
     lcd.begin(16, 2);
@@ -167,6 +174,7 @@ void setup() {
     lcd.clear();
     lcd.print("PEMSS");
     updateBatteryDisplay(50); // Initial battery display
+
 }
 
 // --- Function forward declarations ---
@@ -186,7 +194,8 @@ bool writeNDEFMessage(uint8_t* message, uint8_t length);
 void updateModeDisplay(int mode);
 void streamCallback(FirebaseStream data);
 void streamTimeoutCallback(bool timeout);
-void uploadToFirestore(const String& tagData);
+void uploadToRTDB(const String& tagData);
+void setDeviceStatus(const String& status); // Forward declaration for device status update
 
 void loop() {
     checkSerialCommand();
@@ -208,37 +217,60 @@ void loop() {
         wifiMode = false; // Reset the flag after entering Wi-Fi mode
     }
 
+    // --- Refactored NFC waiting logic ---
+    static bool waitingForWrite = false;
+    static bool waitingForRead = false;
+    static bool waitingForContinuousRead = false;
+    static unsigned long lastNfcCheck = 0;
+    static unsigned long nfcCheckInterval = 100; // Check every 100ms
+
     if (writeRequested) {
-        Serial.println("Waiting for NFC card to write...");
-        lcd.setCursor(0, 0);
-        lcd.clear();
-        lcd.print("Waiting for");
-        lcd.setCursor(0, 1);
-        lcd.print("NFC Card...");
-        detectAndWriteNFC();
+        waitingForWrite = true;
         writeRequested = false;
+        lcd.setCursor(0, 0);
+        lcd.clear();
+        lcd.print("Waiting for");
+        lcd.setCursor(0, 1);
+        lcd.print("NFC Card...");
+        Serial.println("Waiting for NFC card to write...");
     }
-
     if (readRequested) {
-        Serial.println("Waiting for NFC card to read...");
+        waitingForRead = true;
+        readRequested = false;
         lcd.setCursor(0, 0);
         lcd.clear();
         lcd.print("Waiting for");
         lcd.setCursor(0, 1);
         lcd.print("NFC Card...");
-        detectAndReadNFC();
-        readRequested = false;
+        Serial.println("Waiting for NFC card to read...");
+    }
+    if (continuousReadMode) {
+        waitingForContinuousRead = true;
+    } else {
+        waitingForContinuousRead = false;
     }
 
-    if (continuousReadMode && (millis() - lastReadTime >= 300)) {
-        Serial.println("Continuous read mode: Waiting for NFC card...");
-        lcd.setCursor(0, 0);
-        lcd.clear();
-        lcd.print("Waiting for");
-        lcd.setCursor(0, 1);
-        lcd.print("NFC Card...");
-        detectAndReadNFC();
-        lastReadTime = millis();
+    // Non-blocking NFC card check
+    if (millis() - lastNfcCheck > nfcCheckInterval) {
+        lastNfcCheck = millis();
+        uint8_t uid[7];
+        uint8_t uidLength;
+        if (waitingForWrite) {
+            if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength)) {
+                detectAndWriteNFC();
+                waitingForWrite = false;
+            }
+        } else if (waitingForRead) {
+            if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength)) {
+                detectAndReadNFC();
+                waitingForRead = false;
+            }
+        } else if (waitingForContinuousRead && (millis() - lastReadTime >= 300)) {
+            if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength)) {
+                detectAndReadNFC();
+                lastReadTime = millis();
+            }
+        }
     }
 
     int adcBattery = analogRead(BATTERY_PIN);
@@ -247,7 +279,47 @@ void loop() {
     batteryPercent = constrain(batteryPercent, 0, 100);
 
     updateBatteryDisplay(batteryPercent);
+
+    static unsigned long lastStatusCheck = 0;
+    if (millis() - lastStatusCheck > 10000) { // Check every 10 seconds
+        lastStatusCheck = millis();
+        if (wifiConnected && firebaseInitialized && WiFi.status() == WL_CONNECTED) {
+            setDeviceStatus("online");
+        } else if (wifiConnected && firebaseInitialized) {
+            setDeviceStatus("offline");
+        }
+    }
+
+    // Heartbeat: update last_seen timestamp in RTDB every 8-10 seconds (randomized)
+    static unsigned long lastHeartbeat = 0;
+    static unsigned long heartbeatInterval = 8000 + random(0, 2001); // 8000-10000 ms
+    if (!heartbeatInitialized && wifiConnected && firebaseInitialized && WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+        // Set last_seen to 0 at the start of heartbeat
+        Firebase.RTDB.setInt(&fbdo, "/Esp32_client1/last_seen", 0);
+        heartbeatInitialized = true;
+    }
+    if (millis() - lastHeartbeat > heartbeatInterval) {
+        lastHeartbeat = millis();
+        heartbeatInterval = 8000 + random(0, 2001); // Randomize next interval
+        if (wifiConnected && firebaseInitialized && WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+            // Store current time as last_seen (seconds since epoch)
+            time_t now;
+            time(&now);
+            Firebase.RTDB.setInt(&fbdo, "/Esp32_client1/last_seen", now);
+        }
+    }
+
+    static unsigned long lastStatusAutoUpdate = 0;
+    if (millis() - lastStatusAutoUpdate > 8000) {
+        lastStatusAutoUpdate = millis();
+        if (wifiConnected && firebaseInitialized && WiFi.status() == WL_CONNECTED) {
+            setDeviceStatus("online");
+        } else if (wifiConnected && firebaseInitialized) {
+            setDeviceStatus("offline");
+        }
+    }
 }
+
 
 bool connectWithSavedCredentials() {
     String ssid = preferences.getString("ssid", "");
@@ -348,18 +420,38 @@ void detectAndWriteNFC() {
     if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength)) {
         Serial.println("NFC Detected! Formatting and Writing...");
         pNote(859, 200);
+        lcd.clear();
+        lcd.print("Formatting NFC...");
+        lcd.setCursor(0, 1);
+        lcd.print("Don't remove card!");
 
-        if (formatNFC()) {
+        // Indicate formatting in progress with yellow LED
+        // Blink yellow LED during formatting
+        for (int i = 0; i < 3; i++) {
+            digitalWrite(LED_YELLOW, HIGH);
+            delay(200);
+            digitalWrite(LED_YELLOW, LOW);
+            delay(200);
+        }
+        bool formatResult = formatNFC();
+
+        if (formatResult) {
             Serial.println("Format successful!");
-
-            if (writeNDEFText(textToWrite.c_str())) {
+            // Indicate write in progress with yellow LED
+            digitalWrite(LED_YELLOW, HIGH);
+            bool writeResult = writeNDEFText(textToWrite.c_str());
+            digitalWrite(LED_YELLOW, LOW);
+            if (writeResult) {
                 Serial.println("Write successful!");
                 lcd.setCursor(0, 0);
                 lcd.clear();
                 lcd.print("Write Success:");
                 lcd.setCursor(0, 1);
-                lcd.print(textToWrite);
+                lcd.print("PEMSS");
+                // Green LED for up to 2 seconds
+                digitalWrite(LED_GREEN, HIGH);
                 delay(2000);
+                digitalWrite(LED_GREEN, LOW);
             } else {
                 Serial.println("Write failed!");
                 lcd.setCursor(0, 0);
@@ -372,7 +464,10 @@ void detectAndWriteNFC() {
             lcd.setCursor(0, 0);
             lcd.clear();
             lcd.print("Format Failed!");
+            // Yellow LED for 2 seconds to indicate formatting error
+            digitalWrite(LED_YELLOW, HIGH);
             delay(2000);
+            digitalWrite(LED_YELLOW, LOW);
         }
     } else {
         Serial.println("No NFC detected. Try again.");
@@ -403,13 +498,13 @@ void detectAndReadNFC() {
             lcd.setCursor(0, 1);
             lcd.print(tagData);
 
-            // Upload to Firestore (for data storage)
+            // Upload to RTDB (for data storage)
             if (wifiConnected && firebaseInitialized) {
                 if (Firebase.ready() && WiFi.status() == WL_CONNECTED) {
-                    uploadToFirestore(tagData);
+                    uploadToRTDB(tagData);
                 }
             }
-
+            // Removed: last_seen update on NFC tap (now handled only by heartbeat)
             delay(2000);
         } else {
             Serial.println("Read failed!");
@@ -426,53 +521,46 @@ void detectAndReadNFC() {
     }
 }
 
-// Enhanced Firestore upload function
-void uploadToFirestore(const String& tagData) {
-    Serial.println("Uploading to Firestore...");
-    // Always update the same document for real-time update effect
-    String documentPath = "scanned_data/scan";
-    FirebaseJson content;
-    content.set("fields/data/stringValue", tagData);
-    content.set("fields/device_id/stringValue", "ESP32_client1");
-    content.set("fields/scan_id/stringValue", "scan");
-    // Use createDocument with a fixed document path to overwrite the same document
-    if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", documentPath.c_str(), content.raw())) {
-        Serial.println("Successfully updated Firestore scan document!");
-        Serial.println("Data: " + tagData);
-        digitalWrite(LED_GREEN, HIGH);
-        delay(100);
-        digitalWrite(LED_GREEN, LOW);
-    } else {
-        Serial.println("Failed to update Firestore scan document");
-        Serial.println("Error: " + fbdo.errorReason());
-        digitalWrite(LED_RED, HIGH);
-        delay(100);
-        digitalWrite(LED_RED, LOW);
-    }
-}
-
 String readNFC() {
     String tagData = "";
+    uint8_t raw[128] = {0};
+    int idx = 0;
+    bool foundNdef = false;
+    // Read all user pages (4-41)
     for (uint8_t i = 4; i < 42; i++) {
-        uint8_t data[4] = {0}; // Ensure zero initialization
+        uint8_t data[4] = {0};
         if (nfc.ntag2xx_ReadPage(i, data)) {
             for (int j = 0; j < 4; j++) {
-                if (data[j] == 0xFE) {  // Stop at NDEF end marker
-                    return tagData;
+                if (data[j] == 0xFE) { // NDEF end marker
+                    foundNdef = true;
+                    break;
                 }
-                char c = (char)data[j];
-                if (c >= 32 && c <= 126) {  // Keep only printable characters
-                    tagData += c;
+                if (idx < 128) {
+                    raw[idx++] = data[j];
+                }
+            }
+        }
+        if (foundNdef) break;
+    }
+    // Parse NDEF text record
+    if (raw[0] == 0x03) {
+        uint8_t ndefLen = raw[1];
+        if (raw[2] == 0xD1 && raw[5] == 'T') {
+            uint8_t payloadLen = raw[4];
+            uint8_t status = raw[6];
+            uint8_t langLen = status & 0x3F;
+            uint8_t textStart = 7 + langLen;
+            uint8_t textLen = payloadLen - 1 - langLen;
+            for (uint8_t i = 0; i < textLen; i++) {
+                if ((textStart + i) < 128) {
+                    char c = (char)raw[textStart + i];
+                    if (c >= 32 && c <= 126) {
+                        tagData += c;
+                    }
                 }
             }
         }
     }
-
-    // Optional: Remove first character if it's an unwanted formatting byte
-    if (tagData.startsWith("T")) {
-        tagData = tagData.substring(1);
-    }
-
     return tagData;
 }
 
@@ -500,23 +588,26 @@ bool writeNDEFText(const char* text) {
     memset(ndefMessage, 0, sizeof(ndefMessage));  // Ensure buffer is cleared
 
     uint8_t textLen = strlen(text);
-    uint8_t recordLen = textLen + 4;
+    const char* langCode = "en";
+    uint8_t langLen = 2; // Length of "en"
+    uint8_t payloadLen = 1 + langLen + textLen; // status + lang + text
+    uint8_t recordLen = 5 + payloadLen; // header + type + payload
 
     if (recordLen > 120) return false;
 
     ndefMessage[0] = 0x03;  // NDEF Start
     ndefMessage[1] = recordLen;
-    ndefMessage[2] = 0xD1;  // Short Record
+    ndefMessage[2] = 0xD1;  // Short Record, TNF_WELL_KNOWN
     ndefMessage[3] = 0x01;  // Type Length
-    ndefMessage[4] = textLen;  // Payload Length
+    ndefMessage[4] = payloadLen;  // Payload Length
     ndefMessage[5] = 'T';  // 'T' for Text Record
-
-    memcpy(ndefMessage + 6, text, textLen);
-    ndefMessage[6 + textLen] = '\0';  // Null terminator
-    ndefMessage[7 + textLen] = 0xFE;  // NDEF End Marker
+    ndefMessage[6] = langLen; // Status byte: UTF-8, length of lang code
+    memcpy(ndefMessage + 7, langCode, langLen); // Language code
+    memcpy(ndefMessage + 7 + langLen, text, textLen); // Actual text
+    ndefMessage[7 + langLen + textLen] = 0xFE;  // NDEF End Marker
 
     // Overwrite any remaining space with 0x00 to remove old data
-    for (int i = 6 + textLen + 1; i < 128; i++) {
+    for (int i = 7 + langLen + textLen + 1; i < 128; i++) {
         ndefMessage[i] = 0x00;
     }
 
@@ -710,6 +801,15 @@ void initializeFirebase() {
     lcd.print("Connected!");
     delay(2000);
 
+    // Only set device status if in Wi-Fi mode
+    if (wifiMode) {
+        setDeviceStatus("online");
+    }
+
+    // Set heartbeatInitialized to false so heartbeat logic in loop() takes over
+    extern bool heartbeatInitialized;
+    heartbeatInitialized = false;
+
     // Set up Firebase RTDB stream to listen for commands (RTDB for commands only)
     if (!Firebase.RTDB.beginStream(&fbdo_stream, "/Esp32_client1/command")) {
         Serial.println("Failed to begin RTDB stream for commands");
@@ -830,5 +930,39 @@ void streamCallback(FirebaseStream data) {
 void streamTimeoutCallback(bool timeout) {
     if (timeout) {
         Serial.println("RTDB Stream timeout, resuming...");
+    }
+}
+
+void setDeviceStatus(const String& status) {
+    static String lastStatus = "";
+    lastStatus = status;
+    // Always set the status immediately when called
+    String statusPath = "/Esp32_client1/status";
+    if (Firebase.RTDB.setString(&fbdo, statusPath, status)) {
+        Serial.println("Device status updated: " + status);
+    } else {
+        Serial.println("Failed to update device status: " + fbdo.errorReason());
+    }
+}
+
+void uploadToRTDB(const String& tagData) {
+    Serial.println("Uploading to RTDB...");
+    String scanKey = "/Esp32_client1/scanned_data/scan";
+    FirebaseJson content;
+    content.set("data", tagData);
+    content.set("device_id", "Esp32_client1");
+    content.set("scan_id", "scan");
+    if (Firebase.RTDB.setJSON(&fbdo, scanKey, &content)) {
+        Serial.println("Successfully updated RTDB scan node!");
+        Serial.println("Data: " + tagData);
+        digitalWrite(LED_GREEN, HIGH);
+        delay(100);
+        digitalWrite(LED_GREEN, LOW);
+    } else {
+        Serial.println("Failed to update RTDB scan node");
+        Serial.println("Error: " + fbdo.errorReason());
+        digitalWrite(LED_RED, HIGH);
+        delay(100);
+        digitalWrite(LED_RED, LOW);
     }
 }
